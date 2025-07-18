@@ -18,6 +18,7 @@ on:
       - LICENSE
 env:
   IMAGE_NAME: 'canbus-ws-converter'
+  IMAGE_NAME_LOGGER: 'canbus-logger'
 
 jobs:
   build:
@@ -83,5 +84,18 @@ jobs:
           ghcr.io/datasance/${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.VERSION }}
           ghcr.io/datasance/${{ env.IMAGE_NAME }}:latest
           ghcr.io/datasance/${{ env.IMAGE_NAME }}:main
+    - name: Build and Push to ghcr logger
+      
+      uses: docker/build-push-action@v5
+      id: build_push_ghcr_logger
+      with:
+        context: .
+        file: Dockerfile.logger
+        platforms: linux/amd64, linux/arm64 
+        push: true
+        tags: |
+          ghcr.io/datasance/${{ env.IMAGE_NAME_LOGGER }}:${{ steps.tags.outputs.VERSION }}
+          ghcr.io/datasance/${{ env.IMAGE_NAME_LOGGER }}:latest
+          ghcr.io/datasance/${{ env.IMAGE_NAME_LOGGER }}:main
 
 

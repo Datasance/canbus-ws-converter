@@ -1,0 +1,59 @@
+FROM python:3.13-alpine3.21
+
+# Install system dependencies for CAN bus, Python extensions, and build tools
+RUN apk add --no-cache \
+    can-utils \
+    coreutils \
+    gcc \
+    g++ \
+    make \
+    musl-dev \
+    python3-dev \
+    py3-pip
+
+# Set working directory
+WORKDIR /app
+
+# Install Python dependencies
+RUN python3 -m pip install --no-cache-dir \
+    cantools \
+    numpy \
+    asammdf \
+    python-can
+
+# Remove build dependencies to reduce image size
+RUN apk del \
+    gcc \
+    g++ \
+    make \
+    musl-dev \
+    python3-dev \
+    py3-pip
+
+# Install runtime libraries needed by compiled packages
+RUN apk add --no-cache \
+    libstdc++ \
+    libgcc
+
+# Copy logger script
+COPY app_logger.py .
+
+# Create log directory
+RUN mkdir -p /logs
+
+# Set environment variables
+ENV DEVICE_NAME=device0
+ENV CAN_DEVICE=can0
+ENV LOG_DIR=/logs
+ENV MAX_FILE_SIZE_MB=200
+ENV BATCH_SIZE=1000
+ENV RECOVERY_CYCLE_SECONDS=60
+ENV LOG_INTERVAL=10000
+
+# Python optimization settings
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONGC=1
+
+# Run the logger
+CMD ["python", "app_logger.py"] 
