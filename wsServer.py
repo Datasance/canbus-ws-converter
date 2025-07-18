@@ -78,16 +78,30 @@ class CANBusWebSocketServer:
         if not self.clients:
             return
         
-        # Send raw message to all clients
+        # Prepare tasks for concurrent sending
+        tasks = []
+        client_list = list(self.clients)  # Create a snapshot
         disconnected_clients = set()
-        for client in self.clients:
+        
+        for client in client_list:
             try:
-                await client.send(message)
-            except websockets.exceptions.ConnectionClosed:
-                disconnected_clients.add(client)
+                tasks.append(client.send(message))
             except Exception as e:
-                logger.error(f"Error sending message to client: {e}")
+                logger.error(f"Error preparing message for client: {e}")
                 disconnected_clients.add(client)
+        
+        # Send to all clients concurrently
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Check for exceptions and mark disconnected clients
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    if isinstance(result, websockets.exceptions.ConnectionClosed):
+                        disconnected_clients.add(client_list[i])
+                    else:
+                        logger.error(f"Error sending message to client: {result}")
+                        disconnected_clients.add(client_list[i])
         
         # Clean up disconnected clients
         self.clients -= disconnected_clients
@@ -114,9 +128,42 @@ class CANBusWebSocketServer:
             self.clients.discard(websocket)
             logger.info(f"Client from {client_ip} removed. Active clients: {len(self.clients)}")
     
+    async def _read_stdin_async(self):
+        """Read from stdin using asyncio.StreamReader for non-blocking I/O"""
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        
+        # Create transport for stdin
+        transport, _ = await asyncio.get_event_loop().connect_read_pipe(
+            lambda: protocol, sys.stdin
+        )
+        
+        try:
+            while self.running:
+                if self.shutdown_event.is_set():
+                    break
+                
+                try:
+                    # Read line with timeout
+                    line = await asyncio.wait_for(reader.readline(), timeout=1.0)
+                    if line:
+                        content_data = line.decode().strip()
+                        if content_data:
+                            await self._broadcast_message(content_data)
+                    else:
+                        # No data available
+                        break
+                except asyncio.TimeoutError:
+                    # Timeout - no data available
+                    break
+                except Exception as e:
+                    logger.exception("Error reading from stdin")
+                    break
+        finally:
+            transport.close()
+    
     async def _read_stdin(self):
         """Read CAN bus data from stdin with cyclic recovery mechanism"""
-        loop = asyncio.get_event_loop()
         recovery_cycle_seconds = int(os.getenv("RECOVERY_CYCLE_SECONDS", "60"))
         
         logger.info("Stdin reader started - waiting for data...")
@@ -144,7 +191,6 @@ class CANBusWebSocketServer:
     
     async def _try_read_stdin_cycle(self):
         """Try to read from stdin with 5 attempts, 1 second each"""
-        loop = asyncio.get_event_loop()
         max_retries = 5
         
         for attempt in range(max_retries):
@@ -153,77 +199,103 @@ class CANBusWebSocketServer:
                 if self.shutdown_event.is_set():
                     return False
                 
-                # Read line from stdin asynchronously with timeout
-                try:
-                    line = await asyncio.wait_for(
-                        loop.run_in_executor(None, sys.stdin.readline),
-                        timeout=1.0  # 1 second timeout
-                    )
-                except asyncio.TimeoutError:
-                    # Timeout occurred - no data available
-                    line = None
+                # Use asyncio.StreamReader for non-blocking read
+                reader = asyncio.StreamReader()
+                protocol = asyncio.StreamReaderProtocol(reader)
                 
-                if line:
-                    # Success - process the line
-                    content_data = line.strip()
-                    if content_data:  # Only process non-empty lines
-                        await self._broadcast_message(content_data)
-                    return True  # Successfully read data
-                else:
-                    # No data available
-                    if attempt < max_retries - 1:  # Not the last attempt
+                # Create transport for stdin
+                transport, _ = await asyncio.get_event_loop().connect_read_pipe(
+                    lambda: protocol, sys.stdin
+                )
+                
+                try:
+                    # Read line with timeout
+                    line = await asyncio.wait_for(reader.readline(), timeout=1.0)
+                    if line:
+                        content_data = line.decode().strip()
+                        if content_data:
+                            await self._broadcast_message(content_data)
+                        transport.close()
+                        return True
+                    else:
+                        # No data available
+                        transport.close()
+                        if attempt < max_retries - 1:
+                            logger.info(f"CAN bus check {attempt + 1}/{max_retries} - no activity (engine may be off)")
+                        else:
+                            logger.warning(f"CAN bus health check: No activity detected after {max_retries} attempts (normal when engine is off)")
+                        
+                except asyncio.TimeoutError:
+                    # Timeout - no data available
+                    transport.close()
+                    if attempt < max_retries - 1:
                         logger.info(f"CAN bus check {attempt + 1}/{max_retries} - no activity (engine may be off)")
-                        await asyncio.sleep(1)  # Wait before retry
                     else:
                         logger.warning(f"CAN bus health check: No activity detected after {max_retries} attempts (normal when engine is off)")
                         
+                except Exception as e:
+                    transport.close()
+                    logger.exception("Error reading from stdin")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1)
+                    else:
+                        logger.error("Stdin health check failed - error after all retry attempts")
+                        
             except Exception as e:
-                logger.exception("Error reading from stdin")
-                if attempt < max_retries - 1:  # Not the last attempt
-                    await asyncio.sleep(1)  # Wait before retry
+                logger.exception("Error in stdin cycle")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
                 else:
                     logger.error("Stdin health check failed - error after all retry attempts")
         
-        return False  # Failed to read after all attempts
+        return False
     
     async def _read_stdin_continuously(self):
         """Read from stdin continuously until no data is available"""
-        loop = asyncio.get_event_loop()
         lines_processed = 0
+        log_interval = int(os.getenv("LOG_INTERVAL", "100000"))
         
-        while self.running:
-            try:
-                # Check for shutdown signal
-                if self.shutdown_event.is_set():
-                    return
-                
-                # Read line from stdin asynchronously with timeout
+        # Use asyncio.StreamReader for non-blocking read
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        
+        # Create transport for stdin
+        transport, _ = await asyncio.get_event_loop().connect_read_pipe(
+            lambda: protocol, sys.stdin
+        )
+        
+        try:
+            while self.running:
                 try:
-                    line = await asyncio.wait_for(
-                        loop.run_in_executor(None, sys.stdin.readline),
-                        timeout=1.0  # 1 second timeout
-                    )
+                    # Check for shutdown signal
+                    if self.shutdown_event.is_set():
+                        return
+                    
+                    # Read line with timeout
+                    line = await asyncio.wait_for(reader.readline(), timeout=1.0)
+                    if not line:
+                        # No more data available, exit continuous reading
+                        logger.info(f"CAN bus data stream ended after processing {lines_processed} lines (engine may have stopped)")
+                        return
+                    
+                    content_data = line.decode().strip()
+                    if content_data:
+                        await self._broadcast_message(content_data)
+                        lines_processed += 1
+                        
+                        # Log progress every configured interval
+                        if lines_processed % log_interval == 0:
+                            logger.info(f"CAN bus processing: {lines_processed} messages processed")
+                        
                 except asyncio.TimeoutError:
-                    # Timeout occurred - no data available
-                    line = None
-                
-                if not line:
-                    # No more data available, exit continuous reading
+                    # Timeout - no data available, exit continuous reading
                     logger.info(f"CAN bus data stream ended after processing {lines_processed} lines (engine may have stopped)")
                     return
-                
-                content_data = line.strip()
-                if content_data:  # Only process non-empty lines
-                    await self._broadcast_message(content_data)
-                    lines_processed += 1
-                    
-                    # Log progress every 100 lines
-                    if lines_processed % 100 == 0:
-                        logger.info(f"CAN bus processing: {lines_processed} messages processed")
-                    
-            except Exception as e:
-                logger.exception("Error reading from stdin during continuous mode")
-                return  # Exit continuous reading on error
+                except Exception as e:
+                    logger.exception("Error reading from stdin during continuous mode")
+                    return
+        finally:
+            transport.close()
     
     async def start(self):
         """Start the WebSocket server"""
@@ -253,7 +325,7 @@ class CANBusWebSocketServer:
                 return_when=asyncio.FIRST_COMPLETED
             )
         except Exception as e:
-            logger.exception("Server error")  # Log full stack trace
+            logger.exception("Server error")
         finally:
             self.running = False
             await self.shutdown()
@@ -271,8 +343,8 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt")
     except Exception as e:
-        logger.exception("Fatal error")  # Log full stack trace
-        await server.shutdown()  # Ensure cleanup on unhandled errors
+        logger.exception("Fatal error")
+        await server.shutdown()
         sys.exit(1)
 
 if __name__ == "__main__":

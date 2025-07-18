@@ -76,7 +76,7 @@ jobs:
       id: build_push_ghcr
       with:
         context: .
-        file: Dockerfile
+        file: Dockerfile.app
         platforms: linux/amd64, linux/arm64 
         push: true
         tags: |
