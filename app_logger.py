@@ -12,6 +12,7 @@ from asammdf import MDF, Signal
 import tarfile
 import shutil
 from datetime import datetime
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -28,7 +29,7 @@ class CANLogger:
         self.can_device = os.getenv("CAN_DEVICE", "can0")
         self.log_dir = os.getenv("LOG_DIR", "/logs")
         self.max_file_size_mb = int(os.getenv("MAX_FILE_SIZE_MB", "200"))
-        self.batch_size = int(os.getenv("BATCH_SIZE", "1000"))
+        self.batch_size = int(os.getenv("BATCH_SIZE", "2000"))
         
         # Internal state
         self.can_bus = None
@@ -42,6 +43,20 @@ class CANLogger:
         self.batch_can_ids = []
         self.batch_data_bytes = []
         self.messages_processed = 0
+        
+        # Performance optimization: cache disk space info
+        self.last_disk_check = 0
+        self.disk_check_interval = 1200  # Check disk space every 1200 seconds
+        self.disk_space_ok = True
+        
+        # Performance optimization: cache file size info
+        self.last_file_size_check = 0
+        self.file_size_check_interval = 600  # Check file size every 600 seconds
+        self.current_file_size_mb = 0
+        
+        # Performance monitoring
+        self.last_performance_log = 0
+        self.performance_log_interval = 600  # Log performance every 600 seconds
         
         # Ensure log directory exists
         os.makedirs(self.log_dir, exist_ok=True)
@@ -76,6 +91,15 @@ class CANLogger:
             return False
     
     def _check_disk_space(self):
+        """Optimized disk space checking with caching"""
+        current_time = time.time()
+        
+        # Only check disk space periodically
+        if current_time - self.last_disk_check < self.disk_check_interval:
+            return self.disk_space_ok
+        
+        self.last_disk_check = current_time
+        
         try:
             total, used, free = shutil.disk_usage(self.log_dir)
             free_mb = free / (1024 * 1024)
@@ -83,40 +107,45 @@ class CANLogger:
             if free_mb < 1024:
                 logger.warning(f"Low disk space: {free_mb:.1f}MB free")
                 
-                archive_files = []
-                for file in os.listdir(self.log_dir):
-                    if file.endswith('.tar.bz2'):
-                        file_path = os.path.join(self.log_dir, file)
-                        archive_files.append((file_path, os.path.getmtime(file_path)))
-                
-                archive_files.sort(key=lambda x: x[1])
-                
-                deleted_count = 0
-                for file_path, _ in archive_files:
-                    try:
-                        os.remove(file_path)
-                        deleted_count += 1
-                        logger.info(f"Deleted old archive: {os.path.basename(file_path)}")
-                        
-                        total, used, free = shutil.disk_usage(self.log_dir)
-                        free_mb = free / (1024 * 1024)
-                        if free_mb >= 2048:
-                            break
-                    except Exception as e:
-                        logger.error(f"Failed to delete {file_path}: {e}")
-                
-                if deleted_count > 0:
-                    logger.info(f"Deleted {deleted_count} old archives to free space")
+                # Only do cleanup if we're really low on space
+                if free_mb < 500:
+                    archive_files = []
+                    for file in os.listdir(self.log_dir):
+                        if file.endswith('.tar.bz2'):
+                            file_path = os.path.join(self.log_dir, file)
+                            archive_files.append((file_path, os.path.getmtime(file_path)))
+                    
+                    archive_files.sort(key=lambda x: x[1])
+                    
+                    deleted_count = 0
+                    for file_path, _ in archive_files:
+                        try:
+                            os.remove(file_path)
+                            deleted_count += 1
+                            logger.info(f"Deleted old archive: {os.path.basename(file_path)}")
+                            
+                            total, used, free = shutil.disk_usage(self.log_dir)
+                            free_mb = free / (1024 * 1024)
+                            if free_mb >= 2048:
+                                break
+                        except Exception as e:
+                            logger.error(f"Failed to delete {file_path}: {e}")
+                    
+                    if deleted_count > 0:
+                        logger.info(f"Deleted {deleted_count} old archives to free space")
                 
                 total, used, free = shutil.disk_usage(self.log_dir)
                 free_mb = free / (1024 * 1024)
                 if free_mb < 100:
                     logger.error(f"Critical: Only {free_mb:.1f}MB free space available")
+                    self.disk_space_ok = False
                     return False
             
+            self.disk_space_ok = True
             return True
         except Exception as e:
             logger.error(f"Error checking disk space: {e}")
+            self.disk_space_ok = False
             return False
     
     def _create_new_log_file(self):
@@ -125,11 +154,31 @@ class CANLogger:
                 self.current_mdf.close()
             
             self.current_log_file = os.path.join(self.log_dir, f"{self.device_name}_log.mf4")
+            
+            # Check if existing file exists and handle it based on strategy
+            if os.path.exists(self.current_log_file):
+                file_size_mb = os.path.getsize(self.current_log_file) / (1024 * 1024)
+                logger.info(f"Found existing log file: {self.current_log_file} ({file_size_mb:.1f}MB)")
+                
+                # Archive the existing file
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                archive_name = f"{self.device_name}_{timestamp}.mf4.tar.bz2"
+                archive_path = os.path.join(self.log_dir, archive_name)
+                
+                with tarfile.open(archive_path, 'w:bz2') as tar:
+                    tar.add(self.current_log_file, arcname=os.path.basename(self.current_log_file))
+                
+                os.remove(self.current_log_file)
+                logger.info(f"Archived existing file as: {archive_name}")
+            
+            # Create new MDF file
             self.current_mdf = MDF()
             
             self.batch_timestamps = []
             self.batch_can_ids = []
             self.batch_data_bytes = []
+            self.current_file_size_mb = 0
+            self.last_file_size_check = 0
             
             logger.info(f"Created new log file: {self.current_log_file}")
             return True
@@ -165,13 +214,17 @@ class CANLogger:
             return
         
         try:
-            timestamps_np = np.array(self.batch_timestamps)
+            # Pre-allocate numpy arrays for better performance
+            batch_size = len(self.batch_timestamps)
+            timestamps_np = np.array(self.batch_timestamps, dtype=np.float64)
             can_ids_np = np.array(self.batch_can_ids, dtype=np.uint32)
             
+            # Find maximum data length once
             max_data_length = max(len(d) for d in self.batch_data_bytes) if self.batch_data_bytes else 0
             
             signals = []
             
+            # Create CAN ID signal
             can_id_sig = Signal(
                 samples=can_ids_np,
                 timestamps=timestamps_np,
@@ -180,25 +233,38 @@ class CANLogger:
             )
             signals.append(can_id_sig)
             
-            for i in range(max_data_length):
-                samples = np.array([d[i] if len(d) > i else 0 for d in self.batch_data_bytes], dtype=np.uint8)
+            # Pre-allocate data array for better performance
+            if max_data_length > 0:
+                data_array = np.zeros((batch_size, max_data_length), dtype=np.uint8)
                 
-                sig = Signal(
-                    samples=samples,
-                    timestamps=timestamps_np,
-                    name=f"Byte_{i}",
-                    unit="",
-                )
-                signals.append(sig)
+                # Fill data array efficiently
+                for i, data_bytes in enumerate(self.batch_data_bytes):
+                    data_length = len(data_bytes)
+                    if data_length > 0:
+                        data_array[i, :data_length] = data_bytes
+                
+                # Create byte signals efficiently
+                for i in range(max_data_length):
+                    sig = Signal(
+                        samples=data_array[:, i],
+                        timestamps=timestamps_np,
+                        name=f"Byte_{i}",
+                        unit="",
+                    )
+                    signals.append(sig)
             
             self.current_mdf.append(signals)
             self.current_mdf.save(self.current_log_file, overwrite=True)
+            
+            # Update file size cache
+            self.current_file_size_mb = os.path.getsize(self.current_log_file) / (1024 * 1024)
+            self.last_file_size_check = time.time()
             
             self.batch_timestamps = []
             self.batch_can_ids = []
             self.batch_data_bytes = []
             
-            logger.debug(f"Wrote batch of {len(timestamps_np)} messages to MDF4")
+            logger.debug(f"Wrote batch of {batch_size} messages to MDF4")
             
         except Exception as e:
             logger.error(f"Failed to write batch to MDF4: {e}")
@@ -207,11 +273,21 @@ class CANLogger:
         if not self.current_log_file or not os.path.exists(self.current_log_file):
             return
         
+        current_time = time.time()
+        
+        # Only check file size periodically
+        if current_time - self.last_file_size_check < self.file_size_check_interval:
+            return
+        
+        self.last_file_size_check = current_time
+        
         try:
-            file_size_mb = os.path.getsize(self.current_log_file) / (1024 * 1024)
+            # Use cached file size if available, otherwise check
+            if self.current_file_size_mb == 0:
+                self.current_file_size_mb = os.path.getsize(self.current_log_file) / (1024 * 1024)
             
-            if file_size_mb >= self.max_file_size_mb:
-                logger.info(f"File size {file_size_mb:.1f}MB exceeds limit {self.max_file_size_mb}MB, rotating...")
+            if self.current_file_size_mb >= self.max_file_size_mb:
+                logger.info(f"File size {self.current_file_size_mb:.1f}MB exceeds limit {self.max_file_size_mb}MB, rotating...")
                 
                 self._write_batch_to_mdf()
                 self._archive_current_file()
@@ -231,6 +307,7 @@ class CANLogger:
                 logger.info("Shutdown signal received, stopping CAN logger")
                 break
             
+            # Check disk space less frequently
             if not self._check_disk_space():
                 logger.error("Insufficient disk space, stopping logging")
                 await asyncio.sleep(30)
@@ -250,6 +327,13 @@ class CANLogger:
                     if len(self.batch_timestamps) >= self.batch_size:
                         self._write_batch_to_mdf()
                         self._check_file_size_and_rotate()
+                    
+                    # Performance monitoring
+                    current_time = time.time()
+                    if current_time - self.last_performance_log >= self.performance_log_interval:
+                        self.last_performance_log = current_time
+                        messages_per_second = self.messages_processed / (current_time - self.last_performance_log + self.performance_log_interval)
+                        logger.info(f"Performance: {self.messages_processed} messages processed, ~{messages_per_second:.1f} msg/s")
                     
                     if self.messages_processed % log_interval == 0:
                         logger.info(f"CAN logging: {self.messages_processed} messages processed")
